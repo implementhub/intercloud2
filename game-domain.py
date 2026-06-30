@@ -23,7 +23,6 @@ logger = logging.getLogger("game-service")
 MOVES = ["rock", "paper", "scissors"]
 
 # Globale Speicherstrukturen
-# Erwartetes Format für active_games: { "spiffe://...": { "commitment": "...", "my_move": "..." } }
 active_games = {}
 scores = {}  # spiffe_id -> {"wins": 0, "losses": 0}
 
@@ -62,15 +61,22 @@ def get_peer_spiffe_id(handler):
     return None
 
 def get_own_spiffe_id():
+    """Liest die eigene SPIFFE-ID absolut und fehlersicher über openssl aus."""
     try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cert_path = os.path.join(base_dir, 'certs', 'svid.pem')
+        
+        if not os.path.exists(cert_path):
+            return "unknown"
+
         result = subprocess.run(
-            ['openssl', 'x509', '-in', 'certs/svid.pem', '-text', '-noout'],
+            ['openssl', 'x509', '-in', cert_path, '-text', '-noout'],
             capture_output=True, text=True, check=True
         )
         for line in result.stdout.split('\n'):
             if 'URI:spiffe://' in line:
                 return line.split('URI:')[1].strip()
-    except Exception as e:
+    except Exception:
         return "unknown"
     return "unknown"
 
@@ -79,7 +85,6 @@ def get_own_spiffe_id():
 class GameHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
-        # 1. Authentifizierung: SPIFFE-ID erzwingen
         peer_id = get_peer_spiffe_id(self)
         if not peer_id:
             logger.warning(f"Abgewiesen: Unauthentifizierter Zugriff von {self.client_address[0]}")
@@ -104,14 +109,12 @@ class GameHandler(BaseHTTPRequestHandler):
         commitment = data["commitment"]
         my_move = secrets.choice(MOVES)
 
-        # Spielstatus für diesen spezifischen Peer speichern
         active_games[peer_id] = {
             "commitment": commitment,
             "my_move": my_move
         }
         logger.info(f"Challenge von {peer_id} erhalten. Mein verdeckter Zug: {my_move}")
 
-        # Nachricht 2 (Response) direkt als HTTP-Antwort zurücksenden
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -131,7 +134,6 @@ class GameHandler(BaseHTTPRequestHandler):
         opponent_move = data["move"]
         opponent_salt = data["salt"]
 
-        # Commitment verifizieren
         if not verify_commitment(opponent_move, opponent_salt, game["commitment"]):
             logger.error(f"❌ Verifikation fehlgeschlagen für {peer_id}! Schwindel erkannt.")
             self.send_response(400)
@@ -139,19 +141,16 @@ class GameHandler(BaseHTTPRequestHandler):
             return
 
         my_move = game["my_move"]
-        # Aus Sicht des Servers (uns): wie schneidet mein_zug gegen gegner_zug ab?
         server_result = decide(my_move, opponent_move)
         
         logger.info(f"[DUELL] Ich ({my_move}) vs {peer_id} ({opponent_move}) -> Ergebnis für mich: {server_result}")
         
-        # Score aktualisieren (nur wenn kein Unentschieden)
         if server_result != "tie":
             update_score(peer_id, server_result)
-            del active_games[peer_id] # Spiel beendet
+            del active_games[peer_id]
 
         own_id = get_own_spiffe_id()
 
-        # Ergebnis an den Client zurückmelden
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -161,7 +160,7 @@ class GameHandler(BaseHTTPRequestHandler):
         }).encode())
 
     def log_message(self, format, *args):
-        pass # Standard HTTP-Logs unterdrücken für saubereren Output
+        pass
 
 # ---------- Client-Spielfluss (Initiator) ----------
 
@@ -189,7 +188,6 @@ def play_round(target_url, context):
 
         logger.info(f"[CLIENT] Starte neue Runde. Mein geheimer Zug: {my_move}")
 
-        # 1. Challenge senden (Nachricht 1)
         try:
             response_data = send_request(f"{target_url}/challenge", {
                 "type": "challenge",
@@ -199,11 +197,9 @@ def play_round(target_url, context):
             logger.error(f"Challenge fehlgeschlagen: {e}")
             return
 
-        # 2. Antwort erhalten (Nachricht 2)
         opponent_move = response_data.get("move")
         logger.info(f"[CLIENT] Gegner-Zug empfangen: {opponent_move}. Sende Reveal...")
 
-        # 3. Reveal senden (Nachricht 3)
         try:
             result_data = send_request(f"{target_url}/reveal", {
                 "type": "reveal",
@@ -214,21 +210,19 @@ def play_round(target_url, context):
             logger.error(f"Reveal fehlgeschlagen: {e}")
             return
 
-        # Auswertung aus Sicht des Clients (A)
-        server_status = result_data.get("status") # Wie der Server abgeschnitten hat
+        server_status = result_data.get("status")
+        
+        server_spiffe_id = result_data.get("server_spiffe_id", target_url)
         
         if server_status == "tie":
             logger.info("  Unentschieden! Sofortige Replay-Runde wird gestartet...")
             time.sleep(1)
-            continue # Springt zurück an den Anfang der Schleife
+            continue
         
-        # Wenn der Server gewinnt, hat der Client verloren, und umgekehrt
         client_result = "loss" if server_status == "win" else "win"
         logger.info(f"🎉 Rundenende! Ergebnis für mich: {client_result.upper()}")
         
-        # Da wir im Single-Domain-Modus die gegnerische SPIFFE-ID im Client-Modus 
-        # nicht direkt aus der HTTP-Response lesen können, nutzen wir die Target-URL als Schlüssel
-        update_score(target_url, client_result)
+        update_score(server_spiffe_id, client_result)
         break
 
 def game_loop(target_url):
@@ -249,8 +243,6 @@ def game_loop(target_url):
         elif action == "x":
             print("Spiel beendet.")
             break
-
-# ---------- Main Engine ----------
 
 def start_server(port):
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -273,10 +265,7 @@ def main():
         print("Error: Zertifikatsdateien nicht gefunden! Bitte starte zuerst den spiffe-helper.")
         return 1
 
-    # Server im Hintergrund starten
     threading.Thread(target=start_server, args=(args.port,), daemon=True).start()
-    
-    # Client-Loop im Vordergrund ausführen
     game_loop(args.target)
 
 if __name__ == '__main__':
