@@ -223,7 +223,7 @@ def game_loop(target_url):
         print(" [n] Neues Spiel starten")
         print(" [s] Aktuelle Scores anzeigen")
         print(" [x] Beenden")
-        action = input("Was möchtest du tun? ").strip_base().lower()
+        action = input("Was möchtest du tun? ").strip().lower()
 
         if action == "n":
             play_round(target_url, context)
