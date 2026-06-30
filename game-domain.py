@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+import json
+import ssl
+import time
+import urllib.request
+import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
+import threading
+import secrets
+import hashlib
+import os
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("game-service")
+
+MOVES = ["rock", "paper", "scissors"]
+
+# Globale Speicherstrukturen
+# Erwartetes Format für active_games: { "spiffe://...": { "commitment": "...", "my_move": "..." } }
+active_games = {}
+scores = {}  # spiffe_id -> {"wins": 0, "losses": 0}
+
+# ---------- Crypto & Spiel-Logik Helpers ----------
+
+def make_commitment(move, salt):
+    return hashlib.sha256(f"{move}{salt}".encode()).hexdigest()
+
+def verify_commitment(move, salt, commitment):
+    return make_commitment(move, salt) == commitment
+
+def decide(a, b):
+    if a == b:
+        return "tie"
+    wins = {("rock", "scissors"), ("scissors", "paper"), ("paper", "rock")}
+    return "win" if (a, b) in wins else "loss"
+
+def update_score(peer_id, result):
+    if peer_id not in scores:
+        scores[peer_id] = {"wins": 0, "losses": 0}
+    if result == "win":
+        scores[peer_id]["wins"] += 1
+    elif result == "loss":
+        scores[peer_id]["losses"] += 1
+
+def get_peer_spiffe_id(handler):
+    """Extrahiert die SPIFFE-ID (URI) aus dem Client-Zertifikat."""
+    try:
+        cert = handler.connection.getpeercert()
+        if cert and 'subjectAltName' in cert:
+            for san in cert['subjectAltName']:
+                if san[0] == 'URI' and san[1].startswith('spiffe://'):
+                    return san[1]
+    except Exception as e:
+        logger.error(f"Fehler bei SPIFFE-ID Extraktion: {e}")
+    return None
+
+# ---------- HTTP Server Handler ----------
+
+class GameHandler(BaseHTTPRequestHandler):
+
+    def do_POST(self):
+        # 1. Authentifizierung: SPIFFE-ID erzwingen
+        peer_id = get_peer_spiffe_id(self)
+        if not peer_id:
+            logger.warning(f"Abgewiesen: Unauthentifizierter Zugriff von {self.client_address[0]}")
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"Unauthorized: Valid SPIFFE ID required.")
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode()
+        data = json.loads(body)
+
+        if self.path == "/challenge" and data.get("type") == "challenge":
+            self.handle_challenge(data, peer_id)
+        elif self.path == "/reveal" and data.get("type") == "reveal":
+            self.handle_reveal(data, peer_id)
+        else:
+            self.send_response(400)
+            self.end_headers()
+
+    def handle_challenge(self, data, peer_id):
+        commitment = data["commitment"]
+        my_move = secrets.choice(MOVES)
+
+        # Spielstatus für diesen spezifischen Peer speichern
+        active_games[peer_id] = {
+            "commitment": commitment,
+            "my_move": my_move
+        }
+        logger.info(f"Challenge von {peer_id} erhalten. Mein verdeckter Zug: {my_move}")
+
+        # Nachricht 2 (Response) direkt als HTTP-Antwort zurücksenden
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "type": "response",
+            "move": my_move
+        }).encode())
+
+    def handle_reveal(self, data, peer_id):
+        game = active_games.get(peer_id)
+        if not game:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "No active challenge for this ID"}).encode())
+            return
+
+        opponent_move = data["move"]
+        opponent_salt = data["salt"]
+
+        # Commitment verifizieren
+        if not verify_commitment(opponent_move, opponent_salt, game["commitment"]):
+            logger.error(f"❌ Verifikation fehlgeschlagen für {peer_id}! Schwindel erkannt.")
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        my_move = game["my_move"]
+        # Aus Sicht des Servers (uns): wie schneidet mein_zug gegen gegner_zug ab?
+        server_result = decide(my_move, opponent_move)
+        
+        logger.info(f"[DUELL] Ich ({my_move}) vs {peer_id} ({opponent_move}) -> Ergebnis für mich: {server_result}")
+        
+        # Score aktualisieren (nur wenn kein Unentschieden)
+        if server_result != "tie":
+            update_score(peer_id, server_result)
+            del active_games[peer_id] # Spiel beendet
+
+        # Ergebnis an den Client zurückmelden
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "status": server_result
+        }).encode())
+
+    def log_message(self, format, *args):
+        pass # Standard HTTP-Logs unterdrücken für saubereren Output
+
+# ---------- Client-Spielfluss (Initiator) ----------
+
+def build_client_ssl_context():
+    context = ssl.create_default_context()
+    context.load_cert_chain('certs/svid.pem', 'certs/svid_key.pem')
+    context.load_verify_locations('certs/svid_bundle.pem')
+    context.check_hostname = False
+    return context
+
+def send_request(url, payload, context):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, context=context, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+def play_round(target_url, context):
+    """Spielt eine vollständige Runde. Wiederholt sich bei Tie automatisch."""
+    while True:
+        my_move = secrets.choice(MOVES)
+        salt = secrets.token_hex(8)
+        commitment = make_commitment(my_move, salt)
+
+        logger.info(f"[CLIENT] Starte neue Runde. Mein geheimer Zug: {my_move}")
+
+        # 1. Challenge senden (Nachricht 1)
+        try:
+            response_data = send_request(f"{target_url}/challenge", {
+                "type": "challenge",
+                "commitment": commitment
+            }, context)
+        except Exception as e:
+            logger.error(f"Challenge fehlgeschlagen: {e}")
+            return
+
+        # 2. Antwort erhalten (Nachricht 2)
+        opponent_move = response_data.get("move")
+        logger.info(f"[CLIENT] Gegner-Zug empfangen: {opponent_move}. Sende Reveal...")
+
+        # 3. Reveal senden (Nachricht 3)
+        try:
+            result_data = send_request(f"{target_url}/reveal", {
+                "type": "reveal",
+                "move": my_move,
+                "salt": salt
+            }, context)
+        except Exception as e:
+            logger.error(f"Reveal fehlgeschlagen: {e}")
+            return
+
+        # Auswertung aus Sicht des Clients (A)
+        server_status = result_data.get("status") # Wie der Server abgeschnitten hat
+        
+        if server_status == "tie":
+            logger.info("  Unentschieden! Sofortige Replay-Runde wird gestartet...")
+            time.sleep(1)
+            continue # Springt zurück an den Anfang der Schleife
+        
+        # Wenn der Server gewinnt, hat der Client verloren, und umgekehrt
+        client_result = "loss" if server_status == "win" else "win"
+        logger.info(f"🎉 Rundenende! Ergebnis für mich: {client_result.upper()}")
+        
+        # Da wir im Single-Domain-Modus die gegnerische SPIFFE-ID im Client-Modus 
+        # nicht direkt aus der HTTP-Response lesen können, nutzen wir die Target-URL als Schlüssel
+        update_score(target_url, client_result)
+        break
+
+def game_loop(target_url):
+    context = build_client_ssl_context()
+    time.sleep(2)
+    
+    while True:
+        print("\n--- SPIFFE ROCK-PAPER-SCISSORS ---")
+        print(" [n] Neues Spiel starten")
+        print(" [s] Aktuelle Scores anzeigen")
+        print(" [x] Beenden")
+        action = input("Was möchtest du tun? ").strip_base().lower()
+
+        if action == "n":
+            play_round(target_url, context)
+        elif action == "s":
+            print(json.dumps({"scores": scores}, indent=4))
+        elif action == "x":
+            print("Spiel beendet.")
+            break
+
+# ---------- Main Engine ----------
+
+def start_server(port):
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain('certs/svid.pem', 'certs/svid_key.pem')
+    context.load_verify_locations('certs/svid_bundle.pem')
+    context.verify_mode = ssl.CERT_REQUIRED
+
+    server = ThreadingHTTPServer(('localhost', port), GameHandler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    logger.info(f"mTLS Game Server lauscht auf Port {port}...")
+    server.serve_forever()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, required=True, help="Lokaler Server-Port")
+    parser.add_argument('--target', type=str, required=True, help="Gegnerische HTTPS-URL (z.B. https://localhost:8002)")
+    args = parser.parse_args()
+
+    if not all(os.path.exists(f'certs/{f}') for f in ['svid.pem', 'svid_key.pem', 'svid_bundle.pem']):
+        print("Error: Zertifikatsdateien nicht gefunden! Bitte starte zuerst den spiffe-helper.")
+        return 1
+
+    # Server im Hintergrund starten
+    threading.Thread(target=start_server, args=(args.port,), daemon=True).start()
+    
+    # Client-Loop im Vordergrund ausführen
+    game_loop(args.target)
+
+if __name__ == '__main__':
+    main()
