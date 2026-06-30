@@ -11,6 +11,7 @@ import secrets
 import hashlib
 import os
 import logging
+import subprocess
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +60,19 @@ def get_peer_spiffe_id(handler):
     except Exception as e:
         logger.error(f"Fehler bei SPIFFE-ID Extraktion: {e}")
     return None
+
+def get_own_spiffe_id():
+    try:
+        result = subprocess.run(
+            ['openssl', 'x509', '-in', 'certs/svid.pem', '-text', '-noout'],
+            capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.split('\n'):
+            if 'URI:spiffe://' in line:
+                return line.split('URI:')[1].strip()
+    except Exception as e:
+        return "unknown"
+    return "unknown"
 
 # ---------- HTTP Server Handler ----------
 
@@ -135,12 +149,15 @@ class GameHandler(BaseHTTPRequestHandler):
             update_score(peer_id, server_result)
             del active_games[peer_id] # Spiel beendet
 
+        own_id = get_own_spiffe_id()
+
         # Ergebnis an den Client zurückmelden
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps({
-            "status": server_result
+            "status": server_result,
+            "server_spiffe_id": own_id
         }).encode())
 
     def log_message(self, format, *args):
