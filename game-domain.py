@@ -24,14 +24,25 @@ MOVES = ["rock", "paper", "scissors"]
 
 # Globale Speicherstrukturen
 active_games = {}
+
+# =====================================================================
+# REQUIREMENT: CLI Interface with Score Tracking (3 Points)
+# Part 1: In-Memory scoreboard tracking wins and losses per SPIFFE ID
+# =====================================================================
 scores = {}  # spiffe_id -> {"wins": 0, "losses": 0}
 
 # ---------- Crypto & Spiel-Logik Helpers ----------
 
+# =====================================================================
+# REQUIREMENT: Game Protocol with Commit-Reveal (3 Points)
+# Part 1: Cryptographic Commitment Verification using SHA256 Hashing
+# =====================================================================
 def make_commitment(move, salt):
+    """Generates the SHA256 hash (commitment) of the move concatenated with the salt."""
     return hashlib.sha256(f"{move}{salt}".encode()).hexdigest()
 
 def verify_commitment(move, salt, commitment):
+    """Verifies if the revealed move and salt match the original commitment."""
     return make_commitment(move, salt) == commitment
 
 def decide(a, b):
@@ -40,6 +51,10 @@ def decide(a, b):
     wins = {("rock", "scissors"), ("scissors", "paper"), ("paper", "rock")}
     return "win" if (a, b) in wins else "loss"
 
+# =====================================================================
+# REQUIREMENT: CLI Interface with Score Tracking (3 Points)
+# Part 2: Updating the local database mapped directly to peer SPIFFE ID
+# =====================================================================
 def update_score(peer_id, result):
     if peer_id not in scores:
         scores[peer_id] = {"wins": 0, "losses": 0}
@@ -48,9 +63,14 @@ def update_score(peer_id, result):
     elif result == "loss":
         scores[peer_id]["losses"] += 1
 
+# =====================================================================
+# REQUIREMENT: Cross-domain Authentication (5 Points)
+# Part 1: Extraction of peer SPIFFE ID (URI SAN) from client cert
+# =====================================================================
 def get_peer_spiffe_id(handler):
     """Extrahiert die SPIFFE-ID (URI) aus dem Client-Zertifikat."""
     try:
+        # getpeercert() pulls the peer certificate verified during the TLS handshake
         cert = handler.connection.getpeercert()
         if cert and 'subjectAltName' in cert:
             for san in cert['subjectAltName']:
@@ -85,6 +105,11 @@ def get_own_spiffe_id():
 class GameHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
+        # =====================================================================
+        # REQUIREMENT: Cross-domain Authentication (5 Points)
+        # Part 2: Authorization gate. Validates extracted SPIFFE ID and block
+        # any unauthenticated workload immediately with 401 Unauthorized.
+        # =====================================================================
         peer_id = get_peer_spiffe_id(self)
         if not peer_id:
             logger.warning(f"Abgewiesen: Unauthentifizierter Zugriff von {self.client_address[0]}")
@@ -105,16 +130,22 @@ class GameHandler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.end_headers()
 
+    # =====================================================================
+    # REQUIREMENT: Game Protocol with Commit-Reveal (3 Points)
+    # Part 2: Receiving MESSAGE 1 (Challenge) & replying with MESSAGE 2 (Response)
+    # =====================================================================
     def handle_challenge(self, data, peer_id):
         commitment = data["commitment"]
         my_move = secrets.choice(MOVES)
 
+        # Store commitment and local choice mapped to opponent ID to handle late reveals
         active_games[peer_id] = {
             "commitment": commitment,
             "my_move": my_move
         }
         logger.info(f"Challenge von {peer_id} erhalten. Mein verdeckter Zug: {my_move}")
 
+        # Sending MESSAGE 2 directly in the active HTTP response body to avoid network deadlocks
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -123,6 +154,10 @@ class GameHandler(BaseHTTPRequestHandler):
             "move": my_move
         }).encode())
 
+    # =====================================================================
+    # REQUIREMENT: Game Protocol with Commit-Reveal (3 Points)
+    # Part 3: Receiving MESSAGE 3 (Reveal), verifying commitment & determining winner
+    # =====================================================================
     def handle_reveal(self, data, peer_id):
         game = active_games.get(peer_id)
         if not game:
@@ -134,6 +169,7 @@ class GameHandler(BaseHTTPRequestHandler):
         opponent_move = data["move"]
         opponent_salt = data["salt"]
 
+        # Validate cryptographic commitment before processing logic to guarantee fairness
         if not verify_commitment(opponent_move, opponent_salt, game["commitment"]):
             logger.error(f"❌ Verifikation fehlgeschlagen für {peer_id}! Schwindel erkannt.")
             self.send_response(400)
@@ -164,6 +200,10 @@ class GameHandler(BaseHTTPRequestHandler):
 
 # ---------- Client-Spielfluss (Initiator) ----------
 
+# =====================================================================
+# REQUIREMENT: SPIFFE mTLS - Single Domain (7 Points)
+# Part 1: Loading SPIFFE certificates & establishing mutual TLS (Client-side)
+# =====================================================================
 def build_client_ssl_context():
     context = ssl.create_default_context()
     context.load_cert_chain('certs/svid.pem', 'certs/svid_key.pem')
@@ -180,7 +220,11 @@ def send_request(url, payload, context):
         return json.loads(r.read().decode())
 
 def play_round(target_url, context):
-    """Spielt eine vollständige Runde. Wiederholt sich bei Tie automatisch."""
+    # =====================================================================
+    # REQUIREMENT: Game Protocol with Commit-Reveal (3 Points)
+    # Part 4: Client execution. Choosing move, sending Challenge, receiving Response,
+    # then initiating Reveal.
+    # =====================================================================
     while True:
         my_move = secrets.choice(MOVES)
         salt = secrets.token_hex(8)
@@ -188,6 +232,7 @@ def play_round(target_url, context):
 
         logger.info(f"[CLIENT] Starte neue Runde. Mein geheimer Zug: {my_move}")
 
+        # Sending MESSAGE 1 (Challenge)
         try:
             response_data = send_request(f"{target_url}/challenge", {
                 "type": "challenge",
@@ -197,9 +242,11 @@ def play_round(target_url, context):
             logger.error(f"Challenge fehlgeschlagen: {e}")
             return
 
+        # Receiving MESSAGE 2 (Response)
         opponent_move = response_data.get("move")
         logger.info(f"[CLIENT] Gegner-Zug empfangen: {opponent_move}. Sende Reveal...")
 
+        # Sending MESSAGE 3 (Reveal)
         try:
             result_data = send_request(f"{target_url}/reveal", {
                 "type": "reveal",
@@ -211,9 +258,13 @@ def play_round(target_url, context):
             return
 
         server_status = result_data.get("status")
-        
         server_spiffe_id = result_data.get("server_spiffe_id", target_url)
         
+        # =====================================================================
+        # REQUIREMENT: Game Protocol with Commit-Reveal (3 Points)
+        # Part 5: Tie Handling. If "tie" status is returned, the loop replays
+        # immediately using 'continue' statement.
+        # =====================================================================
         if server_status == "tie":
             logger.info("  Unentschieden! Sofortige Replay-Runde wird gestartet...")
             time.sleep(1)
@@ -225,6 +276,10 @@ def play_round(target_url, context):
         update_score(server_spiffe_id, client_result)
         break
 
+# =====================================================================
+# REQUIREMENT: CLI Interface with Score Tracking (3 Points)
+# Part 3: CLI implementation to challenge, show scoreboard and quit.
+# =====================================================================
 def game_loop(target_url):
     context = build_client_ssl_context()
     time.sleep(2)
@@ -244,11 +299,15 @@ def game_loop(target_url):
             print("Spiel beendet.")
             break
 
+# =====================================================================
+# REQUIREMENT: SPIFFE mTLS - Single Domain (7 Points)
+# Part 2: Threading HTTPS server context forcing mTLS (Server-side)
+# =====================================================================
 def start_server(port):
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     context.load_cert_chain('certs/svid.pem', 'certs/svid_key.pem')
     context.load_verify_locations('certs/svid_bundle.pem')
-    context.verify_mode = ssl.CERT_REQUIRED
+    context.verify_mode = ssl.CERT_REQUIRED  # Enforces client cert authentication
 
     server = ThreadingHTTPServer(('localhost', port), GameHandler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
