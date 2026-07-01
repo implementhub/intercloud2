@@ -255,49 +255,69 @@ spiffe://<trust-domain>/<service>
 
 # 4. How to Run Locally
 
-## Step 1 — Trigger SVID Generation
+## Prerequisites
 
-Make sure SPIRE is running and your `spiffe-helper` instances have generated the workloads' credentials.
+Before running the game, ensure that:
 
-Trigger them using:
+- A **SPIRE Server** and **SPIRE Agent** are running and configured.
+- Your workloads are registered with SPIRE.
+- The corresponding **X.509-SVID** certificates have been generated.
+
+---
+
+## Step 1 — Configure SVID Certificates
+
+The game dynamically loads its identity from a `certs/` directory relative to where `game-domain.py` is executed.
+
+Ensure that the following files are available:
+
+- `certs/svid.pem` – Workload certificate
+- `certs/svid_key.pem` – Workload private key
+- `certs/svid_bundle.pem` – SPIFFE trust bundle
+
+> **Tip:** You can use the `spiffe-helper` daemon or the raw `spire-agent` API fetch commands to automatically generate and periodically rotate these files.
+
+---
+
+## Step 2 — Make the Game Script Executable
+
+Ensure that the Python script has execution permissions:
 
 ```bash
-~/start-helpers.sh
+chmod +x game-domain.py
 ```
 
 ---
 
-## Step 2 — Start Workload 1 (Port 8001)
+## Step 3 — Start Peer A (Port 8001)
 
-Open a terminal (for example, a tmux pane) and run:
+Launch the first game instance, listening on port **8001** and targeting Peer B on **port 8002**:
 
 ```bash
-cd ~/workload1
-./game-domain.py --port 8001 --target https://localhost:8002
+python3 game-domain.py --port 8001 --target https://localhost:8002
 ```
 
 ---
 
-## Step 3 — Start Workload 2 (Port 8002)
+## Step 4 — Start Peer B (Port 8002)
 
-Open another terminal and run:
+In a separate terminal (or on another virtual machine), launch the second instance pointing back to Peer A:
 
 ```bash
-cd ~/workload2
-./game-domain.py --port 8002 --target https://localhost:8001
+python3 game-domain.py --port 8002 --target https://localhost:8001
 ```
 
 ---
 
-## Step 4 — Play
+## Step 5 — Start Playing
 
-Start a new secure game round by typing:
+To initiate a new cryptographically secured game round, type:
 
 ```text
 n
 ```
 
-Display the scoreboard (containing validated SPIFFE IDs) by typing:
+To display the live in-memory scoreboard (showing authenticated peer SPIFFE IDs and their wins/losses), type:
 
 ```text
 s
