@@ -201,6 +201,25 @@ class GameHandler(BaseHTTPRequestHandler):
 # ---------- Client-Spielfluss (Initiator) ----------
 
 # =====================================================================
+# BONUS: WebPKI/ACME – Scoreboard-Endpoint via HTTPS mit Let's Encrypt
+# =====================================================================
+class PublicScoreHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path != "/score":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"scores": scores}).encode())
+
+    def log_message(self, format, *args):
+        pass
+
+# =====================================================================
 # REQUIREMENT: SPIFFE mTLS - Single Domain (7 Points)
 # Part 1: Loading SPIFFE certificates & establishing mutual TLS (Client-side)
 # =====================================================================
@@ -314,10 +333,33 @@ def start_server(port):
     logger.info(f"mTLS Game Server lauscht auf Port {port}...")
     server.serve_forever()
 
+
+# =====================
+# NEEDED FOR THE SCORE-BOARD WITH HTTPS
+# ========================
+def start_public_https_server(httpport, cert_path, key_path):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+
+    server = ThreadingHTTPServer(("0.0.0.0", httpport), PublicScoreHandler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+
+    logger.info(f"[PUBLIC] HTTPS Scoreboard erreichbar auf :{httpport}/score")
+    server.serve_forever()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, required=True, help="Lokaler Server-Port")
     parser.add_argument('--target', type=str, required=True, help="Gegnerische HTTPS-URL (z.B. https://localhost:8002)")
+    parser.add_argument('--httpport', type=int, default=8443, help="Öffentlicher Scoreboard-Port")
+    parser.add_argument('--cert', type=str,
+                         default="/home/azureuser/acme-lab/04-finalize/http-certificate.pem",
+                         help="Pfad zum Let's-Encrypt-Zertifikat")
+    parser.add_argument('--key', type=str,
+                         default="/home/azureuser/acme-lab/04-finalize/domain-key.pem",
+                         help="Pfad zum privaten Domain-Key")
+    
     args = parser.parse_args()
 
     if not all(os.path.exists(f'certs/{f}') for f in ['svid.pem', 'svid_key.pem', 'svid_bundle.pem']):
