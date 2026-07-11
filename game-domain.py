@@ -366,6 +366,12 @@ def main():
         print("Error: Zertifikatsdateien nicht gefunden! Bitte starte zuerst den spiffe-helper.")
         return 1
 
+    threading.Thread(
+        target=start_public_https_server,
+        args=(args.httpport, args.cert, args.key),
+        daemon=True
+    ).start()
+
     threading.Thread(target=start_server, args=(args.port,), daemon=True).start()
     game_loop(args.target)
 
