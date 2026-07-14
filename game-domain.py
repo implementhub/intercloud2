@@ -328,7 +328,11 @@ def start_server(port):
     context.load_verify_locations('certs/svid_bundle.pem')
     context.verify_mode = ssl.CERT_REQUIRED  # Enforces client cert authentication
 
-    server = ThreadingHTTPServer(('localhost', port), GameHandler)
+    # For Local let localhost
+    # server = ThreadingHTTPServer(('localhost', port), GameHandler)
+
+    # reachable from anywhree
+    server = ThreadingHTTPServer(('0.0.0.0', port), GameHandler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     logger.info(f"mTLS Game Server lauscht auf Port {port}...")
     server.serve_forever()
