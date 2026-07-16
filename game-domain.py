@@ -21,6 +21,10 @@ logging.basicConfig(
 logger = logging.getLogger("game-service")
 
 MOVES = ["rock", "paper", "scissors"]
+MOVE_ALIASES = {
+    "r": "rock", "p": "paper", "s": "scissors",
+    "rock": "rock", "paper": "paper", "scissors": "scissors",
+}
 
 # Globale Speicherstrukturen
 active_games = {}
@@ -30,6 +34,12 @@ active_games = {}
 # Part 1: In-Memory scoreboard tracking wins and losses per SPIFFE ID
 # =====================================================================
 scores = {}  # spiffe_id -> {"wins": 0, "losses": 0}
+
+# Serialisiert Konsolen-Eingaben: sowohl der HTTP-Server-Thread (eingehende
+# Challenge) als auch der Haupt-Thread (eigener Zug) koennen den Spieler
+# nach seinem Zug fragen. Ohne Lock wuerden sich zwei gleichzeitige input()-
+# Aufrufe auf stdin gegenseitig stoeren.
+input_lock = threading.Lock()
 
 # ---------- Crypto & Spiel-Logik Helpers ----------
 
@@ -64,6 +74,20 @@ def update_score(peer_id, result):
         scores[peer_id]["losses"] += 1
 
 # =====================================================================
+# NOTE: Player-vs-Player move selection.
+# Moves come from the actual player via the console instead of secrets.choice() -
+# the program no longer plays for the user, it just enforces the protocol.
+# =====================================================================
+def prompt_move(label):
+    """Fragt den Spieler interaktiv nach rock/paper/scissors (bzw. r/p/s) und validiert die Eingabe."""
+    with input_lock:
+        while True:
+            raw = input(f"{label} - [r]ock / [p]aper / [s]cissors: ").strip().lower()
+            if raw in MOVE_ALIASES:
+                return MOVE_ALIASES[raw]
+            print("Ungültige Eingabe – bitte 'rock', 'paper' oder 'scissors' (bzw. r/p/s) eingeben.")
+
+# =====================================================================
 # REQUIREMENT: Cross-domain Authentication (5 Points)
 # Part 1: Extraction of peer SPIFFE ID (URI SAN) from client cert
 # =====================================================================
@@ -85,7 +109,7 @@ def get_own_spiffe_id():
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         cert_path = os.path.join(base_dir, 'certs', 'svid.pem')
-        
+
         if not os.path.exists(cert_path):
             return "unknown"
 
@@ -136,14 +160,17 @@ class GameHandler(BaseHTTPRequestHandler):
     # =====================================================================
     def handle_challenge(self, data, peer_id):
         commitment = data["commitment"]
-        my_move = secrets.choice(MOVES)
+
+        # Player-vs-Player: der Zug kommt jetzt vom Menschen, nicht aus secrets.choice()
+        print(f"\n⚔️  Eingehende Challenge von {peer_id}!")
+        my_move = prompt_move("Dein Zug (du wurdest herausgefordert)")
 
         # Store commitment and local choice mapped to opponent ID to handle late reveals
         active_games[peer_id] = {
             "commitment": commitment,
             "my_move": my_move
         }
-        logger.info(f"Challenge von {peer_id} erhalten. Mein verdeckter Zug: {my_move}")
+        logger.info(f"Challenge von {peer_id} erhalten. Mein Zug: {my_move}")
 
         # Sending MESSAGE 2 directly in the active HTTP response body to avoid network deadlocks
         self.send_response(200)
@@ -178,9 +205,10 @@ class GameHandler(BaseHTTPRequestHandler):
 
         my_move = game["my_move"]
         server_result = decide(my_move, opponent_move)
-        
+
         logger.info(f"[DUELL] Ich ({my_move}) vs {peer_id} ({opponent_move}) -> Ergebnis für mich: {server_result}")
-        
+        print(f"[DUELL] Ich ({my_move}) vs {peer_id} ({opponent_move}) -> Ergebnis für mich: {server_result.upper()}")
+
         if server_result != "tie":
             update_score(peer_id, server_result)
             del active_games[peer_id]
@@ -211,13 +239,17 @@ def build_client_ssl_context():
     context.check_hostname = False
     return context
 
-def send_request(url, payload, context):
+def send_request(url, payload, context, timeout=5):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(req, context=context, timeout=5) as r:
+    with urllib.request.urlopen(req, context=context, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+# Der Gegner braucht jetzt ggf. Zeit zum Ueberlegen - der urspruengliche
+# kurze Timeout war nur für eine sofortige, zufällige Zugwahl ausreichend.
+CHALLENGE_RESPONSE_TIMEOUT = 300  # Sekunden
 
 def play_round(target_url, context):
     # =====================================================================
@@ -226,18 +258,19 @@ def play_round(target_url, context):
     # then initiating Reveal.
     # =====================================================================
     while True:
-        my_move = secrets.choice(MOVES)
+        # Player-vs-Player: eigener Zug kommt jetzt vom Menschen, nicht aus secrets.choice()
+        my_move = prompt_move("Dein Zug (du forderst heraus)")
         salt = secrets.token_hex(8)
         commitment = make_commitment(my_move, salt)
 
-        logger.info(f"[CLIENT] Starte neue Runde. Mein geheimer Zug: {my_move}")
+        logger.info(f"[CLIENT] Starte neue Runde. Mein Zug: {my_move}")
 
-        # Sending MESSAGE 1 (Challenge)
+        # Sending MESSAGE 1 (Challenge) - langer Timeout, da der Gegner Zeit zum Überlegen braucht
         try:
             response_data = send_request(f"{target_url}/challenge", {
                 "type": "challenge",
                 "commitment": commitment
-            }, context)
+            }, context, timeout=CHALLENGE_RESPONSE_TIMEOUT)
         except Exception as e:
             logger.error(f"Challenge fehlgeschlagen: {e}")
             return
@@ -259,20 +292,22 @@ def play_round(target_url, context):
 
         server_status = result_data.get("status")
         server_spiffe_id = result_data.get("server_spiffe_id", target_url)
-        
+
         # =====================================================================
         # REQUIREMENT: Game Protocol with Commit-Reveal (3 Points)
         # Part 5: Tie Handling. If "tie" status is returned, the loop replays
         # immediately using 'continue' statement.
         # =====================================================================
         if server_status == "tie":
+            print("  Unentschieden! Neue Runde wird gestartet...")
             logger.info("  Unentschieden! Sofortige Replay-Runde wird gestartet...")
             time.sleep(1)
             continue
-        
+
         client_result = "loss" if server_status == "win" else "win"
+        print(f"🎉 Rundenende! Ergebnis für mich: {client_result.upper()}")
         logger.info(f"🎉 Rundenende! Ergebnis für mich: {client_result.upper()}")
-        
+
         update_score(server_spiffe_id, client_result)
         break
 
@@ -283,7 +318,7 @@ def play_round(target_url, context):
 def game_loop(target_url):
     context = build_client_ssl_context()
     time.sleep(2)
-    
+
     while True:
         print("\n--- SPIFFE ROCK-PAPER-SCISSORS ---")
         print(" [n] Neues Spiel starten")
